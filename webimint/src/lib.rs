@@ -1,14 +1,14 @@
-mod db;
-
-use db::ConfigKey;
-pub use db::WasmDb;
 use fedimint_api::Amount;
-use fedimint_core::modules::mint::tiered::TieredMulti;
+use fedimint_api::NumPeers;
+use fedimint_api::TieredMulti;
+use fedimint_api::{
+    db::{Database, DatabaseKeyPrefixConst},
+    encoding::{Decodable, Encodable},
+};
 use mint_client::mint::SpendableNote;
 
 use std::sync::Arc;
 
-use fedimint_api::db::Database;
 use fedimint_core::config::ClientConfig;
 use mint_client::api::{WsFederationApi, WsFederationConnect};
 use mint_client::{UserClient, UserClientConfig};
@@ -20,6 +20,18 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::future_to_promise;
 
 type Result<T> = std::result::Result<T, JsValue>;
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct ConfigKey;
+
+const CONFIG_KEY_PREFIX: u8 = 0x50;
+impl DatabaseKeyPrefixConst for ConfigKey {
+    const DB_PREFIX: u8 = CONFIG_KEY_PREFIX;
+    type Key = Self;
+
+    // FIXME: would be nice to store ClientConfig here, not just JSON serialization
+    type Value = String;
+}
 
 fn anyhow_to_js(error: anyhow::Error) -> JsValue {
     JsValue::from(error.to_string())
@@ -56,12 +68,13 @@ pub struct Client {
 impl Client {
     pub async fn load() -> anyhow::Result<Self> {
         tracing::info!("instantiating wasmdb");
-        let db = Box::new(WasmDb::new().await) as Box<dyn Database>;
+        let db: Database = fedimint_rexie::RexieDb::new("webimint".to_string(), "main".to_string()).await.into();
         tracing::info!("looking up config");
         let cfg_json = db
+            .begin_transaction()
             .get_value(&ConfigKey)
             .expect("db error")
-            .ok_or(anyhow::anyhow!("No client config in dexie"))?;
+            .ok_or(anyhow::anyhow!("No client config in rexie"))?;
         let cfg = serde_json::from_str(&cfg_json)?;
         tracing::info!("deserializing");
         let user_client = UserClient::new(UserClientConfig(cfg), db, Default::default());
@@ -73,12 +86,13 @@ impl Client {
     }
     pub async fn new(connection_string: &str) -> anyhow::Result<Self> {
         let connect_cfg: WsFederationConnect = serde_json::from_str(connection_string)?;
-        let api = WsFederationApi::new(connect_cfg.max_evil, connect_cfg.members);
-        let cfg: ClientConfig = api.request("/config", (), CurrentConsensus::new(connect_cfg.max_evil)).await?;
-        // let db = Box::new(MemDatabase::new());
-        let db = Box::new(WasmDb::new().await) as Box<dyn Database>;
-        db.insert_entry(&ConfigKey, &serde_json::to_string(&cfg)?)
+        let api = WsFederationApi::new(connect_cfg.members);
+        let cfg: ClientConfig = api.request("/config", (), CurrentConsensus::new(api.peers().threshold())).await?;
+        let db: Database = fedimint_rexie::RexieDb::new("webimint".to_string(), "main".to_string()).await.into();
+        let mut dbtx = db.begin_transaction();
+        dbtx.insert_entry(&ConfigKey, &serde_json::to_string(&cfg)?)
             .expect("db error");
+        dbtx.commit_tx().await.expect("DB Error");
         let user_client = UserClient::new(UserClientConfig(cfg), db, Default::default());
         let client = Self {
             user_client: Arc::new(user_client),
@@ -92,13 +106,13 @@ impl Client {
         let amount = 1000;
         let description = "description".into();
         tracing::info!("making rng");
-        let mut rng = rand::rngs::OsRng::new().unwrap();
+        let mut rng = rand::rngs::OsRng;
 
         let amt = fedimint_api::Amount::from_sat(amount);
         tracing::info!("getting invoice");
         let confirmed_invoice = self
             .user_client
-            .generate_invoice(amt, description, &mut rng)
+            .generate_invoice(amt, description, &mut rng, None)
             .await?;
         tracing::info!("got invoice");
         let invoice = confirmed_invoice.invoice;
@@ -149,7 +163,7 @@ impl WasmClient {
         let client = self.client.clone();
         future_to_promise(async move {
             let coins = parse_coins(&coins);
-            let rng = rand::rngs::OsRng::new().unwrap();
+            let rng = rand::rngs::OsRng;
             // TODO: handle result
             client.user_client.reissue(coins, rng).await;
             client.user_client.fetch_all_coins().await;
@@ -162,7 +176,7 @@ impl WasmClient {
         let client = self.client.clone();
         future_to_promise(async move {
             let amount = Amount::from_sat(amount as u64);
-            let rng = rand::rngs::OsRng::new().unwrap();
+            let rng = rand::rngs::OsRng;
             let coins = client
                 .user_client
                 .spend_ecash(amount, rng)
